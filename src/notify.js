@@ -36,6 +36,5 @@ export async function notify(level, title, body = '', campaignId = null) {
     );
   }
 
-  const results = await Promise.allSettled(tasks);
-  for (const r of results) if (r.status === 'rejected') console.error('[notify] delivery failed:', r.reason?.message);
+  await Promise.allSettled(tasks);
 }

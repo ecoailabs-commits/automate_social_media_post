@@ -36,7 +36,4 @@ app.use('/api', (_req, res) => res.status(404).json({ error: 'Not found' }));
 app.use(express.static(path.join(__dirname, '..', 'public'), { index: 'index.html' }));
 
 bootstrapAdmin();
-app.listen(config.port, () => {
-  console.log(`AI Automated Ads running at ${config.publicUrl} (port ${config.port})`);
-  startScheduler();
-});
+app.listen(config.port, () => startScheduler());

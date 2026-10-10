@@ -1,22 +1,25 @@
 import { Router } from 'express';
 import fs from 'node:fs';
+import multer from 'multer';
 import { all, one, run, getSetting, setSetting } from '../db.js';
 import { config } from '../config.js';
 import { requireRole } from '../auth.js';
 import { audit } from '../audit.js';
 import { creativePath, uploadPath } from '../ai/creative.js';
+import { pagePublishStatus, postToPage, listPagePosts, editPagePost } from '../platforms/meta.js';
 import { portfolio } from '../services/metrics.js';
 import { budgetCaps } from '../services/campaigns.js';
 import { h, httpError } from './util.js';
 
 const r = Router();
+const pageUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024 } });
 
 r.get('/dashboard', requireRole('editor'), h(() => ({
   ...portfolio(),
   counts: Object.fromEntries(all('SELECT status, COUNT(*) AS n FROM campaigns GROUP BY status').map((x) => [x.status, x.n])),
   unread: one('SELECT COUNT(*) AS n FROM notifications WHERE read = 0').n,
   openSuggestions: one(`SELECT COUNT(*) AS n FROM suggestions WHERE status = 'open'`).n,
-  aiConfigured: !!config.anthropic.apiKey,
+  aiConfigured: config.ai.configured,
 })));
 
 r.get('/notifications', requireRole('editor'), h((req) => {
@@ -56,6 +59,53 @@ r.put('/settings', requireRole('admin'), h((req) => {
   setSetting('budget_caps', { maxDaily: Math.min(maxDaily, config.budget.maxDailyPerCampaign), maxTotal: Math.min(maxTotal, config.budget.maxTotalPerCampaign) });
   setSetting('require_separate_approver', !!req.body.requireSeparateApprover);
   audit(req, 'settings.update', 'settings', null, req.body);
+}));
+
+// ---------- Facebook Page organic posts (free, no ad budget) ----------
+r.get('/meta/page-status', requireRole('editor'), h(() => pagePublishStatus()));
+
+r.get('/meta/page-posts', requireRole('editor'), h(() => listPagePosts(10)));
+
+r.put('/meta/page-posts/:postId', requireRole('editor'), h(async (req) => {
+  const message = String(req.body.message ?? '').trim();
+  if (!message) throw httpError(400, 'Message cannot be empty');
+  if (message.length > 5000) throw httpError(400, 'Message is too long (max 5000 characters)');
+  const out = await editPagePost(req.params.postId, message);
+  audit(req, 'page.post.edit', 'page', out.id, { message: message.slice(0, 120) });
+  return out;
+}));
+
+r.post('/meta/page-post', requireRole('editor'), pageUpload.single('file'), h(async (req) => {
+  const message = String(req.body.message ?? '').trim();
+  const link = String(req.body.link ?? '').trim();
+  const f = req.file;
+  if (!message && !f) throw httpError(400, 'Write a message or attach an image');
+  if (message.length > 5000) throw httpError(400, 'Message is too long (max 5000 characters)');
+  let imageType;
+  if (f) {
+    const isPng = f.buffer.subarray(0, 4).toString('hex') === '89504e47';
+    const isJpg = f.buffer.subarray(0, 3).toString('hex') === 'ffd8ff';
+    if (!isPng && !isJpg) throw httpError(400, 'Only PNG or JPEG images are accepted');
+    imageType = isPng ? 'image/png' : 'image/jpeg';
+  }
+
+  const status = await pagePublishStatus();
+  if (!status.connected || !status.pageId) throw httpError(409, 'No Facebook Page selected. Open Connections → Meta → Select account first.');
+  // Only block on a positive answer — if the scope check itself failed, let the real call explain.
+  if (status.scopes.length && !status.canPublish) {
+    throw httpError(409, 'Meta must be reconnected with posting permission: Connections → Meta → Reconnect.');
+  }
+
+  try {
+    const out = await postToPage({ message, link, image: f?.buffer, imageType });
+    audit(req, 'page.post', 'page', out.id, { message: message.slice(0, 120), image: !!f, link: link || null });
+    return out;
+  } catch (e) {
+    if (/pages_manage_posts|publish_pages|\(200\)|code 200/i.test(String(e.message))) {
+      throw httpError(409, 'Meta refused: this login is missing posting permission. Connections → Meta → Reconnect.');
+    }
+    throw e;
+  }
 }));
 
 // Authenticated file serving for generated creatives and product photos.

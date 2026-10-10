@@ -10,13 +10,9 @@ export function bootstrapAdmin() {
   const count = one('SELECT COUNT(*) AS n FROM users').n;
   if (count > 0) return;
   const { email, password } = config.bootstrapAdmin;
-  if (!email || !password) {
-    console.warn('[auth] No users exist. Set ADMIN_EMAIL and ADMIN_PASSWORD in .env to create the first admin.');
-    return;
-  }
+  if (!email || !password) return;
   if (password.length < 12) throw new Error('ADMIN_PASSWORD must be at least 12 characters');
   run('INSERT INTO users (email, name, password_hash, role) VALUES (?, ?, ?, ?)', email.toLowerCase(), 'Administrator', hashPassword(password), 'admin');
-  console.log(`[auth] Created admin user ${email}`);
 }
 
 function parseCookies(header = '') {

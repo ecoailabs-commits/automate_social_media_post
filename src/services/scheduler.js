@@ -24,9 +24,8 @@ async function tick() {
       try {
         await changeStatus(c.id, 'ended', null, 'Scheduled end time reached');
         lastAttempt.delete(c.id);
-      } catch (e) {
+      } catch {
         lastAttempt.set(c.id, Date.now());
-        console.error('[scheduler] end', c.id, e.message);
       }
     }
 
@@ -36,9 +35,8 @@ async function tick() {
       try {
         await changeStatus(c.id, 'active', null, 'Scheduled start time reached');
         lastAttempt.delete(c.id);
-      } catch (e) {
+      } catch {
         lastAttempt.set(c.id, Date.now());
-        console.error('[scheduler] start', c.id, e.message);
       }
     }
 
@@ -48,17 +46,15 @@ async function tick() {
       try {
         await syncMetrics(c.id);
         await evaluateRules(c.id);
-      } catch (e) {
-        console.error('[scheduler] monitor', c.id, e.message);
-      }
+      } catch {}
     }
 
     // 4. AI optimisation on a slower cadence (only when there is real data).
-    if (config.anthropic.apiKey) {
+    if (config.ai.configured) {
       for (const c of all(`SELECT id, last_optimized_at FROM campaigns WHERE status = 'active'`)) {
         if (minutesSince(c.last_optimized_at) < config.scheduler.optimizeHours * 60) continue;
         if (!one('SELECT 1 FROM metrics WHERE campaign_id = ? AND impressions > 0 LIMIT 1', c.id)) continue;
-        await generateSuggestions(c.id).catch((e) => console.error('[scheduler] optimize', c.id, e.message));
+        await generateSuggestions(c.id).catch(() => {});
       }
     }
 
@@ -71,8 +67,7 @@ async function tick() {
         if (days < 7) await notify('warning', `${c.platform} connection ${days < 0 ? 'has expired' : `expires in ${Math.ceil(days)} days`}`,'Reconnect it on the Connections page to keep campaigns manageable.');
       }
     }
-  } catch (e) {
-    console.error('[scheduler] tick failed', e);
+  } catch {
   } finally {
     running = false;
   }
@@ -81,5 +76,4 @@ async function tick() {
 export function startScheduler() {
   setTimeout(tick, 5_000);
   setInterval(tick, config.scheduler.tickSeconds * 1000);
-  console.log(`[scheduler] running every ${config.scheduler.tickSeconds}s`);
 }

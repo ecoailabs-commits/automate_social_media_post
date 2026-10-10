@@ -24,11 +24,16 @@ export const config = {
     apiKey: opt('ANTHROPIC_API_KEY'),
     model: opt('ANTHROPIC_MODEL', 'claude-opus-5-5'),
   },
+  groq: {
+    apiKey: opt('GROQ_API_KEY'),
+    model: opt('GROQ_MODEL', 'openai/gpt-oss-120b'),
+  },
 
   meta: {
     appId: opt('META_APP_ID'),
     appSecret: opt('META_APP_SECRET'),
     apiVersion: opt('META_API_VERSION', 'v24.0'),
+    configId: opt('META_CONFIG_ID'),
   },
   google: {
     clientId: opt('GOOGLE_ADS_CLIENT_ID'),
@@ -56,6 +61,13 @@ export const config = {
     emailTo: opt('NOTIFY_EMAIL_TO'),
     slackWebhook: opt('SLACK_WEBHOOK_URL'),
   },
+};
+
+// AI_PROVIDER picks explicitly; otherwise Groq is used when only a Groq key is set.
+const provider = opt('AI_PROVIDER').toLowerCase() || (config.groq.apiKey && !config.anthropic.apiKey ? 'groq' : 'anthropic');
+config.ai = {
+  provider,
+  configured: !!(provider === 'groq' ? config.groq.apiKey : config.anthropic.apiKey),
 };
 
 if (!/^[0-9a-fA-F]{64}$/.test(config.encryptionKey)) {

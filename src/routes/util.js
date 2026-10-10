@@ -7,7 +7,6 @@ export const h = (fn) => async (req, res) => {
     if (!res.headersSent) res.json(out ?? { ok: true });
   } catch (e) {
     const status = e.status ?? (e instanceof PlatformError ? 502 : 500);
-    if (status >= 500) console.error(`[api] ${req.method} ${req.path}:`, e);
     if (!res.headersSent) res.status(status).json({ error: e.message || 'Unexpected error' });
   }
 };

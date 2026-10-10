@@ -39,7 +39,6 @@ r.get('/oauth/:platform/callback', async (req, res) => {
     audit(req, 'connection.oauth', 'connection', p);
     back({ connected: p });
   } catch (e) {
-    console.error('[oauth]', p, e.message);
     back({ error: e.message });
   }
 });
