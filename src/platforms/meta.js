@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import { config } from '../config.js';
 import { all } from '../db.js';
 import { PlatformError, request } from './http.js';
-import { getAccessToken, requireAccount } from './connections.js';
+import { getAccessToken, getConnection, requireAccount } from './connections.js';
 import { creativePath } from '../ai/creative.js';
 import { toMinorUnits } from './money.js';
 
@@ -45,8 +45,16 @@ async function paged(path, params) {
 export function oauthUrl(state, redirectUri) {
   const q = new URLSearchParams({
     client_id: config.meta.appId, redirect_uri: redirectUri, state, response_type: 'code',
-    scope: 'ads_management,ads_read,business_management,pages_show_list,pages_read_engagement',
+    // pages_manage_posts = publish organic posts to a Page (ads don't need it, page posts do).
+    scope: 'ads_management,ads_read,business_management,pages_show_list,pages_read_engagement,pages_manage_posts',
+    // Re-prompt for any permission the user skipped before; otherwise Facebook silently omits it.
+    auth_type: 'rerequest',
   });
+  // Facebook Login for Business apps ignore `scope`; permissions come from a dashboard configuration.
+  if (config.meta.configId) {
+    q.delete('scope');
+    q.set('config_id', config.meta.configId);
+  }
   return `https://www.facebook.com/${config.meta.apiVersion}/dialog/oauth?${q}`;
 }
 
@@ -77,6 +85,122 @@ export async function listAccounts() {
 export async function listPixels(accountId) {
   const px = await paged(`/act_${accountId}/adspixels`, { fields: 'id,name', limit: 100 });
   return px.map((p) => ({ id: p.id, name: p.name }));
+}
+
+// ---------- Organic Page posts (free — not an ad, no budget involved) ----------
+const proof = (token) => crypto.createHmac('sha256', config.meta.appSecret).update(token).digest('hex');
+
+/** A Page-scoped token for the page we are connected to; carries whatever the user granted. */
+async function pageToken(pageId) {
+  const res = await call('GET', '/me/accounts', { fields: 'id,name,access_token' });
+  const page = (res.data ?? []).find((x) => x.id === String(pageId));
+  if (!page?.access_token) {
+    throw new PlatformError(P, 'Facebook Page access is missing. Reconnect Meta on the Connections page and select the account again.');
+  }
+  return page.access_token;
+}
+
+/**
+ * Can the current token publish to the Page? Checked with debug_token so the UI can ask
+ * for a reconnect up front instead of failing halfway through a post.
+ */
+export async function pagePublishStatus() {
+  const conn = getConnection(P);
+  const out = {
+    connected: conn?.status === 'connected',
+    pageId: conn?.extra?.page_id ?? null,
+    pageName: conn?.extra?.page_name ?? null,
+    canPublish: false,
+    scopes: [],
+    valid: null,
+    error: null,
+  };
+  if (!out.connected) return out;
+  try {
+    const token = await getAccessToken(P);
+    const appToken = `${config.meta.appId}|${config.meta.appSecret}`;
+    const d = await request(P, `${graph()}/debug_token?${new URLSearchParams({ input_token: token, access_token: appToken })}`, { extractError });
+    out.scopes = String(d.data?.scopes ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+    out.canPublish = out.scopes.includes('pages_manage_posts');
+    out.valid = d.data?.is_valid ?? null;
+  } catch (e) {
+    out.error = e.message;
+  }
+  return out;
+}
+
+async function postPermalink(postId, pageId, token) {
+  if (!postId) return null;
+  // Meta often omits `permalink`; the stable form is /{page}/posts/{numeric id}.
+  const fallback = postId.includes('_') ? `https://www.facebook.com/${pageId}/posts/${postId.split('_')[1]}` : null;
+  try {
+    const d = await request(P, `${graph()}/${postId}?fields=permalink&access_token=${encodeURIComponent(token)}&appsecret_proof=${proof(token)}`, { extractError });
+    return d.permalink ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+/** Publishes a free organic post to the connected Page. Returns { id, permalink }. */
+export async function postToPage({ message, link, image, imageType }) {
+  const conn = requireAccount(P);
+  const pageId = String(conn.extra?.page_id ?? '');
+  if (!pageId) throw new PlatformError(P, 'Select a Facebook Page on the Connections page first.');
+  const text = String(message ?? '').trim();
+  if (!text && !image) throw new PlatformError(P, 'Write a message or attach an image.');
+  if (link && !/^https?:\/\//i.test(link)) throw new PlatformError(P, 'Link must start with http:// or https://');
+
+  const token = await pageToken(pageId);
+  const url = `${graph()}/${pageId}/${image ? 'photos' : 'feed'}?access_token=${encodeURIComponent(token)}&appsecret_proof=${proof(token)}`;
+  const form = new FormData();
+  if (text) form.append('message', text);
+  if (link) form.append('link', link);
+  if (image) {
+    const type = imageType === 'image/jpeg' ? 'image/jpeg' : 'image/png';
+    form.append('source', new Blob([image], { type }), type === 'image/png' ? 'image.png' : 'image.jpg');
+  }
+  // Fetch sets the multipart boundary itself, so no Content-Type here.
+  const res = await request(P, url, { method: 'POST', body: form, extractError });
+  const id = res.id ?? res.post_id ?? null;
+  return { id, permalink: await postPermalink(id, pageId, token) };
+}
+
+/** Changes the text of an existing post on the connected Page. Meta only allows this for posts the app can manage. */
+export async function editPagePost(postId, message) {
+  const conn = requireAccount(P);
+  const pageId = String(conn.extra?.page_id ?? '');
+  if (!pageId) throw new PlatformError(P, 'Select a Facebook Page on the Connections page first.');
+  // Page post ids look like {pageId}_{postId}; refuse anything that isn't on our Page.
+  if (!String(postId).startsWith(`${pageId}_`)) throw new PlatformError(P, 'This post does not belong to the connected Page.');
+  const text = String(message ?? '').trim();
+  if (!text) throw new PlatformError(P, 'Message cannot be empty.');
+
+  const token = await pageToken(pageId);
+  const body = new URLSearchParams({ message: text, access_token: token, appsecret_proof: proof(token) });
+  await request(P, `${graph()}/${postId}`, {
+    method: 'POST', extractError, body,
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+  });
+  return { id: postId, permalink: await postPermalink(postId, pageId, token) };
+}
+
+/** Most recent organic posts on the connected Page. */
+export async function listPagePosts(limit = 10) {
+  const conn = requireAccount(P);
+  const pageId = String(conn.extra?.page_id ?? '');
+  if (!pageId) throw new PlatformError(P, 'Select a Facebook Page on the Connections page first.');
+  const token = await pageToken(pageId);
+  const q = new URLSearchParams({
+    fields: 'id,message,created_time,permalink', limit: String(limit),
+    access_token: token, appsecret_proof: proof(token),
+  });
+  const res = await request(P, `${graph()}/${pageId}/posts?${q}`, { extractError });
+  return (res.data ?? []).map((p) => ({
+    id: p.id,
+    message: p.message ?? '',
+    createdTime: p.created_time,
+    permalink: p.permalink ?? (String(p.id).includes('_') ? `https://www.facebook.com/${pageId}/posts/${String(p.id).split('_')[1]}` : null),
+  }));
 }
 
 export async function searchLocations(q) {
@@ -272,6 +396,6 @@ export async function fetchMetrics(campaignId, since, until) {
 /** Best-effort removal after a failed deploy. Deleting the campaign cascades to ad sets and ads. */
 export async function cleanup(campaignId) {
   for (const c of objects(campaignId, 'campaign')) {
-    try { await call('DELETE', `/${c.external_id}`); } catch (e) { console.error('[meta] cleanup failed', e.message); }
+    try { await call('DELETE', `/${c.external_id}`); } catch {}
   }
 }

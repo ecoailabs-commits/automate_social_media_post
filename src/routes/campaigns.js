@@ -12,7 +12,7 @@ import { previewVariation } from '../platforms/meta.js';
 import { generateCampaignCopy, regenerateVariation } from '../ai/generate.js';
 import { renderCreatives, storeUploadedCreative, creativePath, UPLOAD_DIR } from '../ai/creative.js';
 import { getCampaign, getVariations, validateCampaignInput, validateVariationEdit } from '../services/campaigns.js';
-import { deployCampaign, changeStatus, setVariationLive, updateDailyBudget, preflight } from '../services/lifecycle.js';
+import { deployCampaign, changeStatus, setVariationLive, updateDailyBudget, preflight, metaMinDaily } from '../services/lifecycle.js';
 import { syncMetrics, summary } from '../services/metrics.js';
 import { addDefaultRules, evaluateRules, RULE_TYPES } from '../services/rules.js';
 import { generateSuggestions, applySuggestion } from '../services/optimizer.js';
@@ -115,7 +115,7 @@ r.put('/campaigns/:id', requireRole('editor'), h((req) => {
   const v = validateCampaignInput({ ...c, ...req.body, start_at: req.body.start_at ?? c.start_at, end_at: req.body.end_at ?? c.end_at });
   const currency = currencyFor(v.platforms);
   run(`UPDATE campaigns SET name=?, product=?, description=?, landing_url=?, audience=?, locations=?, objective=?, platforms=?, budget_split=?, total_budget=?, daily_budget=?,
-      currency=?, start_at=?, end_at=?, age_min=?, age_max=?, product_image=?, tone=?, language=?, variation_count=?, updated_at=datetime('now') WHERE id=?`,
+      currency=?, start_at=?, end_at=?, age_min=?, age_max=?, product_image=?, tone=?, language=?, variation_count=?, last_error=NULL, updated_at=datetime('now') WHERE id=?`,
     v.name, v.product, v.description, v.landing_url, v.audience, JSON.stringify(v.locations), v.objective, JSON.stringify(v.platforms), JSON.stringify(v.budget_split),
     v.total_budget, v.daily_budget, currency, v.start_at.toISOString(), v.end_at.toISOString(), v.age_min, v.age_max, v.product_image, v.tone, v.language, v.variation_count, c.id);
   run(`UPDATE rules SET threshold = ? WHERE campaign_id = ? AND type = 'max_total_spend' AND action = 'end_campaign' AND threshold = ?`, v.total_budget, c.id, c.total_budget);
@@ -147,6 +147,7 @@ r.get('/campaigns/:id', requireRole('editor'), h((req) => {
     metrics: summary(c.id),
     audit: all(`SELECT * FROM audit_logs WHERE (entity_type = 'campaign' AND entity_id = ?) ORDER BY id DESC LIMIT 50`, String(c.id)),
     approver: c.approved_by ? one('SELECT name, email FROM users WHERE id = ?', c.approved_by) : null,
+    metaMinDaily: metaMinDaily(c.currency),
   };
 }));
 

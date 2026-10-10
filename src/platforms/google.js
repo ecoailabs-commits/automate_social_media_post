@@ -81,9 +81,7 @@ export async function listAccounts() {
       } else {
         out.push({ id: String(row.customer.id), name: row.customer.descriptiveName ?? id, currency: row.customer.currencyCode, loginCustomerId: id, active: true });
       }
-    } catch (e) {
-      console.warn(`[google] skipping customer ${id}: ${e.message}`);
-    }
+    } catch {}
   }
   const seen = new Set();
   return { accounts: out.filter((a) => (seen.has(a.id) ? false : seen.add(a.id))) };
@@ -223,7 +221,7 @@ export async function cleanup(campaignId) {
   if (!conn?.account_id) return;
   for (const [kind, resource] of [['campaign', 'campaigns'], ['budget', 'campaignBudgets']]) {
     for (const o of objects(campaignId, kind)) {
-      try { await mutate(conn.account_id, resource, [{ remove: o.external_id }]); } catch (e) { console.error('[google] cleanup failed', e.message); }
+      try { await mutate(conn.account_id, resource, [{ remove: o.external_id }]); } catch {}
     }
   }
 }

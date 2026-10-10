@@ -1,5 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { config } from '../config.js';
+import { groqJSON } from './groq.js';
 
 let client;
 function getClient() {
@@ -13,6 +14,7 @@ function getClient() {
  * Server-side refusal fallback is enabled so a policy decline is retried on Anthropic's recommended model.
  */
 export async function generateJSON({ system, prompt, schema, effort = 'medium', maxTokens = 16000 }) {
+  if (config.ai.provider === 'groq') return groqJSON({ system, prompt, schema, effort, maxTokens });
   let response;
   try {
     response = await getClient().beta.messages.create({

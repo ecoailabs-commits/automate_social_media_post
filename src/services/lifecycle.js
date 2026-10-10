@@ -1,4 +1,4 @@
-import { all, run, one } from '../db.js';
+import { all, run, one, getSetting, setSetting } from '../db.js';
 import { adapter, PLATFORM_NAMES } from '../platforms/index.js';
 import { audit } from '../audit.js';
 import { notify } from '../notify.js';
@@ -20,6 +20,16 @@ async function withLock(campaignId, fn) {
 const setStatus = (id, status, error = null) =>
   run(`UPDATE campaigns SET status = ?, last_error = ?, updated_at = datetime('now') WHERE id = ?`, status, error, id);
 
+/**
+ * Meta's minimum daily ad set budget per currency. Meta only reveals it in a rejection
+ * ("must be more than ₹96.73"), so it is learned from that error and checked before the next deploy.
+ */
+export const metaMinDaily = (currency) => Number(getSetting(`meta_min_daily_${currency}`, 0)) || 0;
+function learnMetaMinDaily(currency, message) {
+  const m = /budget must be more than\D*([\d,]+(?:\.\d+)?)/.exec(String(message));
+  if (m) setSetting(`meta_min_daily_${currency}`, Number(m[1].replace(/,/g, '')));
+}
+
 /** Pre-flight checks so we fail before creating anything on any platform. */
 export function preflight(campaign, variations) {
   const problems = [];
@@ -33,6 +43,14 @@ export function preflight(campaign, variations) {
   }
   const caps = budgetCaps();
   if (campaign.daily_budget > caps.maxDaily) problems.push(`Daily budget exceeds the hard cap (${caps.maxDaily})`);
+  if (campaign.platforms.includes('meta') && new Date(campaign.end_at) - new Date(campaign.start_at) < 864e5) {
+    problems.push('Meta ad sets with a daily budget must run for at least 24 hours. Edit settings: move the end date later');
+  }
+  const minMeta = campaign.platforms.includes('meta') ? metaMinDaily(campaign.currency) : 0;
+  if (minMeta && platformDailyBudget(campaign, 'meta') <= minMeta) {
+    const days = Math.max(1, Math.ceil((new Date(campaign.end_at) - new Date(campaign.start_at)) / 864e5));
+    problems.push(`Meta needs a daily budget above ${minMeta} ${campaign.currency}, but this campaign has ${platformDailyBudget(campaign, 'meta')} ${campaign.currency}/day (total spread over ${days} day(s)). Edit settings: raise the total budget or shorten the dates`);
+  }
   if (new Date(campaign.end_at) <= new Date()) problems.push('Campaign end date has passed');
   return problems;
 }
@@ -79,6 +97,7 @@ export async function deployCampaign(campaignId, req) {
         run('DELETE FROM platform_objects WHERE campaign_id = ? AND platform = ?', campaignId, platform);
         run(`UPDATE deployments SET status = 'rolled_back' WHERE campaign_id = ? AND platform = ? AND status = 'deployed'`, campaignId, platform);
       }
+      learnMetaMinDaily(campaign.currency, e.message);
       setStatus(campaignId, 'approved', e.message);
       audit(req, 'campaign.deploy.failed', 'campaign', campaignId, { error: e.message, rolledBack: done });
       await notify('error', `Deploy failed: ${campaign.name}`, `${e.message}\n\nAll created platform objects were rolled back. Fix the issue and deploy again.`, campaignId);

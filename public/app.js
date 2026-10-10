@@ -16,11 +16,26 @@ async function api(path, { method = 'GET', body, form } = {}) {
   const init = { method, headers: { 'X-Requested-With': 'ads-app' }, credentials: 'same-origin' };
   if (form) init.body = form;
   else if (body !== undefined) { init.headers['Content-Type'] = 'application/json'; init.body = JSON.stringify(body); }
-  const res = await fetch(`/api${path}`, init);
-  const data = res.headers.get('content-type')?.includes('json') ? await res.json() : null;
-  if (res.status === 401 && path !== '/auth/login' && path !== '/auth/me') { state.user = null; render(); }
-  if (!res.ok) throw new Error(data?.error || `Request failed (${res.status})`);
-  return data;
+  const idempotent = !['POST', 'PUT', 'DELETE', 'PATCH'].includes(method);
+  for (let attempt = 0; ; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 30000);
+    try {
+      const res = await fetch(`/api${path}`, { ...init, signal: ctrl.signal });
+      clearTimeout(timer);
+      const data = res.headers.get('content-type')?.includes('json') ? await res.json() : null;
+      if (res.status === 401 && path !== '/auth/login' && path !== '/auth/me') { state.user = null; render(); }
+      if (!res.ok) throw new Error(data?.error || `Request failed (${res.status})`);
+      return data;
+    } catch (e) {
+      clearTimeout(timer);
+      const netFail = e.name === 'AbortError' || e.name === 'TypeError' || /NetworkError|fetch failed|Failed to fetch/i.test(String(e.message));
+      if (netFail && idempotent && attempt < 2) { await new Promise((r) => setTimeout(r, 1500)); continue; } // transient: server restarting / one-off timeout
+      throw new Error(netFail
+        ? 'Server ka jawab nahi aaya (server band hai ya abhi restart hua). 2–3 sec baad dobara try karo; agar bar-bar aaye to mujhe batao.'
+        : e.message);
+    }
+  }
 }
 
 function toast(msg, level = 'info', ms = 6000) {
@@ -64,7 +79,7 @@ function lineChart(rows, { y1 = 'spend', y2 = 'clicks', c1 = '#4f46e5', c2 = '#0
 
 // ---------- shell & router ----------
 const NAV = [
-  ['#/dashboard', 'Dashboard'], ['#/campaigns/new', 'New campaign'], ['#/connections', 'Connections'],
+  ['#/dashboard', 'Dashboard'], ['#/campaigns/new', 'New campaign'], ['#/page-post', 'Page post'], ['#/connections', 'Connections'],
   ['#/notifications', 'Notifications'], ['#/audit', 'Audit log', 'manager'], ['#/settings', 'Settings'],
 ];
 
@@ -88,13 +103,16 @@ async function render() {
   const [path, query] = (location.hash || '#/dashboard').split('?');
   const params = new URLSearchParams(query);
   const m = path.match(/^#\/campaigns\/(\d+)$/);
-  const active = m ? '#/dashboard' : path;
+  const em = path.match(/^#\/campaigns\/(\d+)\/(edit|copy)$/);
+  const active = m || em ? '#/dashboard' : path;
   shell(active);
   const main = $('#main');
   try {
     if (path === '#/campaigns/new') await newCampaignView(main);
+    else if (em) await newCampaignView(main, await api(`/campaigns/${em[1]}`).then((d) => ({ ...d.campaign, metaMinDaily: d.metaMinDaily })), em[2]);
     else if (m) await campaignView(main, Number(m[1]), params);
     else if (path === '#/connections') await connectionsView(main, params);
+    else if (path === '#/page-post') await pagePostView(main);
     else if (path === '#/notifications') await notificationsView(main);
     else if (path === '#/audit') await auditView(main);
     else if (path === '#/settings') await settingsView(main);
@@ -128,7 +146,7 @@ async function dashboardView(main) {
   main.innerHTML = `
     <div class="head"><div><h1>Dashboard</h1><div class="muted">Live data from your connected ad accounts</div></div>
       <div class="actions"><a class="btn primary" href="#/campaigns/new" style="background:var(--primary);color:#fff">+ New AI campaign</a></div></div>
-    ${d.aiConfigured ? '' : '<div class="banner warn">ANTHROPIC_API_KEY is not set on the server — AI generation and optimisation are disabled.</div>'}
+    ${d.aiConfigured ? '' : '<div class="banner warn">No AI key is set on the server (GROQ_API_KEY or ANTHROPIC_API_KEY) — AI generation and optimisation are disabled.</div>'}
     <div class="grid g5">
       ${[['Spend (all)', money(t.spend)], ['Impressions', num(t.impressions)], ['Clicks', num(t.clicks)], ['CTR', pct(t.ctr)], ['Conversions', num(t.conversions)]]
         .map(([l, v]) => `<div class="card kpi"><div class="l">${l}</div><div class="v">${v}</div></div>`).join('')}
@@ -183,16 +201,31 @@ function locationPicker(container, platform, selected) {
   draw();
 }
 
-// ---------- new campaign ----------
-async function newCampaignView(main) {
+// ---------- new / edit / duplicate campaign ----------
+// mode: undefined = new, 'edit' = change an undeployed campaign, 'copy' = new campaign prefilled from `src`.
+async function newCampaignView(main, src = null, mode) {
   const conns = await api('/connections');
   const connected = conns.filter((c) => c.status === 'connected');
-  const now = new Date(Date.now() + 60 * 60e3), end = new Date(Date.now() + 15 * 864e5);
-  const locations = { meta: [], google: [] };
+  const editing = mode === 'edit';
+  if (editing && !['draft', 'generated', 'approved'].includes(src.status)) {
+    main.innerHTML = `<div class="banner warn">This campaign is ${esc(src.status)} and already on the platforms, so its settings can't be edited. <a href="#/campaigns/${src.id}/copy">Duplicate it with new settings</a> instead, or change the daily budget on the Rules &amp; budget tab.</div>`;
+    return;
+  }
+  // An edit keeps its dates unless they have expired; a copy gets fresh ones.
+  const keepDates = editing && new Date(src.end_at) > new Date();
+  const now = keepDates ? new Date(src.start_at) : new Date(Date.now() + 60 * 60e3);
+  const end = keepDates ? new Date(src.end_at) : new Date(Date.now() + 15 * 864e5);
+  const locations = { meta: [...(src?.locations?.meta ?? [])], google: [...(src?.locations?.google ?? [])] };
+  const title = editing ? `Edit “${esc(src.name)}”` : src ? `Duplicate “${esc(src.name)}”` : 'New AI campaign';
+  const intro = editing
+    ? 'Fix any setting that stopped the ads from running (budget, dates, locations, ages, objective, platforms…). Existing ads are kept unless you choose to regenerate them.'
+    : "Describe what you're advertising — AI writes the copy, headlines, CTAs and creatives. Nothing goes live until it's approved and deployed.";
 
   main.innerHTML = `
-    <div class="head"><div><h1>New AI campaign</h1><div class="muted">Describe what you're advertising — AI writes the copy, headlines, CTAs and creatives. Nothing goes live until it's approved and deployed.</div></div></div>
+    <div class="head"><div>${src ? `<a href="#/campaigns/${src.id}" class="small">← Back to campaign</a>` : ''}<h1>${title}</h1><div class="muted">${intro}</div></div></div>
     ${connected.length ? '' : '<div class="banner warn">No ad platforms are connected yet. <a href="#/connections">Connect Meta or Google</a> before creating a campaign.</div>'}
+    ${editing && src.status === 'approved' ? '<div class="banner warn">This campaign is approved. Saving changes revokes the approval, so a manager will need to approve it again before deploying.</div>' : ''}
+    ${src?.last_error ? `<div class="banner err"><b>Last error:</b> ${esc(src.last_error)}</div>` : ''}
     <form id="cf">
       <div class="card"><h2>1 · What are you promoting?</h2>
         <div class="grid g2">
@@ -232,26 +265,49 @@ async function newCampaignView(main) {
         <div id="split"></div>
         <div class="hint" id="budgetHint"></div>
       </div>
-      <div class="actions"><button class="primary" type="submit">Create & generate with AI</button><span class="muted small">You'll review every ad before anything is deployed.</span></div>
+      ${editing ? `<div class="actions"><button class="primary" type="submit">Save changes</button><label class="check"><input type="checkbox" name="regen" ${src.status === 'draft' ? 'checked' : ''}> Regenerate ads with AI after saving</label><a href="#/campaigns/${src.id}" class="small">Cancel</a></div>`
+        : `<div class="actions"><button class="primary" type="submit">Create & generate with AI</button><span class="muted small">You'll review every ad before anything is deployed.</span></div>`}
     </form>`;
 
   const form = $('#cf');
+  if (src) {
+    for (const n of ['product', 'name', 'description', 'landing_url', 'tone', 'language', 'audience', 'objective', 'age_min', 'age_max', 'total_budget', 'product_image']) {
+      if (src[n] != null && form[n]) form[n].value = src[n];
+    }
+    form.variation_count.value = String(src.variation_count ?? 3);
+    if (!editing) form.name.value = `${src.name} (copy)`.slice(0, 120);
+    $$('input[name=pf]', form).forEach((i) => (i.checked = src.platforms.includes(i.value) && !i.disabled));
+  }
   const selectedPfs = () => $$('input[name=pf]:checked', form).map((i) => i.value);
   const drawPlatforms = () => {
     const pfs = selectedPfs();
     $('#locs').innerHTML = pfs.map((p) => `<div class="field"><label>${PF_FULL[p]} locations *</label><div data-loc="${p}"></div></div>`).join('') || '<div class="muted">Select at least one platform.</div>';
     pfs.forEach((p) => locationPicker($(`[data-loc=${p}]`), p, locations[p]));
     const even = pfs.length ? Math.floor(100 / pfs.length) : 0;
-    $('#split').innerHTML = pfs.length > 1 ? `<label>Budget split (%)</label><div class="grid g3">${pfs.map((p, i) => `<div>${pfTag(p)}<input type="number" min="0" max="100" data-split="${p}" value="${i === 0 ? 100 - even * (pfs.length - 1) : even}"></div>`).join('')}</div>` : '';
+    $('#split').innerHTML = pfs.length > 1 ? `<label>Budget split (%)</label><div class="grid g3">${pfs.map((p, i) => `<div>${pfTag(p)}<input type="number" min="0" max="100" data-split="${p}" value="${src?.budget_split?.[p] ?? (i === 0 ? 100 - even * (pfs.length - 1) : even)}"></div>`).join('')}</div>` : '';
     updateHint();
   };
+  // Meta reports its minimum daily ad set budget in the deploy error ("must be more than ₹96.73").
+  const metaMinDaily = src?.metaMinDaily || Number((src?.last_error?.match(/budget must be more than\D*([\d,]+(?:\.\d+)?)/) ?? [])[1]?.replace(/,/g, '')) || 0;
   const updateHint = () => {
     const total = Number(form.total_budget.value), s = new Date(form.start_at.value), e = new Date(form.end_at.value);
     const days = Math.max(1, Math.ceil((e - s) / 864e5));
-    $('#budgetHint').textContent = total > 0 && e > s ? `≈ ${money(total / days)} per day over ${days} day(s). Spend is hard-stopped when the total is reached.` : '';
+    const hint = $('#budgetHint');
+    hint.textContent = total > 0 && e > s ? `≈ ${money(total / days)} per day over ${days} day(s). Spend is hard-stopped when the total is reached.` : '';
+    hint.style.color = '';
+    if (!metaMinDaily || !selectedPfs().includes('meta') || !(e > s)) return;
+    const share = (selectedPfs().length > 1 ? Number($('[data-split=meta]')?.value) || 0 : 100) / 100;
+    if (share > 0 && (total / days) * share > metaMinDaily) return;
+    // Round up a little above Meta's minimum so small rounding never trips it again.
+    const needed = share > 0 ? Math.ceil((metaMinDaily * 1.03 * days) / share / 10) * 10 : 0;
+    hint.style.color = 'var(--err)';
+    hint.innerHTML = `⚠ Meta needs more than ${esc(money(metaMinDaily))} per day. For ${days} day(s) set the total budget to at least <b>${esc(money(needed))}</b>, or shorten the dates.
+      <button type="button" id="fixBudget">Set total to ${esc(money(needed))}</button>`;
+    $('#fixBudget').onclick = () => { form.total_budget.value = needed; updateHint(); };
   };
   $$('input[name=pf]', form).forEach((i) => (i.onchange = drawPlatforms));
   ['total_budget', 'start_at', 'end_at'].forEach((n) => form[n].addEventListener('input', updateHint));
+  form.addEventListener('input', (e) => { if (e.target.dataset.split) updateHint(); });
   drawPlatforms();
 
   $('#pimg').onchange = async (e) => {
@@ -274,6 +330,22 @@ async function newCampaignView(main) {
       locations: Object.fromEntries(pfs.map((p) => [p, locations[p]])),
       start_at: new Date(f.get('start_at')).toISOString(), end_at: new Date(f.get('end_at')).toISOString(),
     };
+    if (editing) {
+      const regen = form.regen.checked;
+      delete body.regen;
+      await busy(e.submitter, async () => {
+        await api(`/campaigns/${src.id}`, { method: 'PUT', body });
+        toast(src.status === 'approved' ? 'Saved — approval revoked, re-approve before deploying' : 'Changes saved', 'success');
+        if (regen) {
+          try {
+            const g = await api(`/campaigns/${src.id}/generate`, { method: 'POST', body: {} });
+            if (g.warnings?.length) toast(`AI notes:\n${g.warnings.join('\n')}`, 'warning', 12000);
+          } catch (err) { toast(`Generation failed: ${err.message}. You can retry from the campaign page.`, 'error', 12000); }
+        }
+        location.hash = `#/campaigns/${src.id}`;
+      }, regen ? 'Saving & regenerating (≈30–90s)…' : 'Saving…').catch(() => {});
+      return;
+    }
     await busy(e.submitter, async () => {
       const c = await api('/campaigns', { method: 'POST', body });
       toast('Campaign created. Generating ads with AI…');
@@ -305,6 +377,8 @@ async function campaignView(main, id, params) {
   if (c.status === 'paused' && can('manager')) btns.push('<button class="primary" data-act="status" data-s="active">Resume</button>');
   if (['active', 'scheduled'].includes(c.status) && can('manager')) btns.push('<button data-act="status" data-s="paused">Pause</button>');
   if (['active', 'paused', 'scheduled'].includes(c.status) && can('manager')) btns.push('<button class="danger" data-act="status" data-s="ended">End campaign</button>');
+  if (['draft', 'generated', 'approved'].includes(c.status)) btns.push(`<a class="btn" href="#/campaigns/${id}/edit">✎ Edit settings</a>`);
+  else btns.push(`<a class="btn" href="#/campaigns/${id}/copy">⧉ Duplicate &amp; edit</a>`);
   if (!deployed && can('manager')) btns.push('<button class="danger" data-act="delete">Delete</button>');
 
   main.innerHTML = `
@@ -312,7 +386,7 @@ async function campaignView(main, id, params) {
       <div class="muted">${c.platforms.map(pfTag).join('')} ${esc(c.objective)} · ${money(c.total_budget, c.currency)} total (${money(c.daily_budget)}/day) · ${dt(c.start_at)} → ${dt(c.end_at)}</div></div>
       <div class="actions">${btns.join('')}</div></div>
     <div class="flow">${FLOW.map(([, l], i) => `<div class="step ${i < fi ? 'done' : i === fi ? 'now' : ''}">${i < fi ? '✓ ' : ''}${l}</div>`).join('')}</div>
-    ${c.last_error ? `<div class="banner err"><b>Last error:</b> ${esc(c.last_error)}</div>` : ''}
+    ${c.last_error ? `<div class="banner err"><b>Last error:</b> ${esc(c.last_error)} ${['draft', 'generated', 'approved'].includes(c.status) ? `<a href="#/campaigns/${id}/edit">Edit settings</a>` : `<a href="#/campaigns/${id}/copy">Duplicate &amp; edit</a>`}</div>` : ''}
     ${d.preflight.length && c.status !== 'draft' ? `<div class="banner warn"><b>Fix before approval/deploy:</b><br>${d.preflight.map(esc).join('<br>')}</div>` : ''}
     ${d.approver ? `<div class="banner info">Approved by ${esc(d.approver.name)} (${esc(d.approver.email)}) at ${dt(c.approved_at)}. Any edit revokes approval.</div>` : ''}
     ${c.status === 'scheduled' ? `<div class="banner info">Deployed and paused on all platforms. Goes live automatically at ${dt(c.start_at)}.</div>` : ''}
@@ -557,7 +631,7 @@ function aiTab(el, d, reload) {
   const c = d.campaign;
   const labels = Object.fromEntries(d.variations.map((v) => [v.id, v.label]));
   el.innerHTML = `<div class="card"><div class="head" style="margin:0 0 10px"><div><h2>AI optimisation suggestions</h2>
-      <div class="muted small">Claude analyses the campaign's real platform metrics. Suggestions are never applied automatically — a manager must click Apply. Last run: ${dt(c.last_optimized_at)}</div></div>
+      <div class="muted small">AI analyses the campaign's real platform metrics. Suggestions are never applied automatically — a manager must click Apply. Last run: ${dt(c.last_optimized_at)}</div></div>
       <button class="primary" id="opt">✨ Analyse now</button></div>
     ${d.suggestions.map((s) => {
       const p = JSON.parse(s.params || '{}');
@@ -628,6 +702,98 @@ async function connectionsView(main, params) {
       }, 'Loading accounts…').catch(() => {});
     });
   }
+}
+
+// ---------- organic Facebook Page post ----------
+async function pagePostView(main) {
+  const conns = await api('/connections');
+  const meta = conns.find((c) => c.platform === 'meta');
+  const [status, posts] = await Promise.all([
+    api('/meta/page-status').catch(() => null),
+    api('/meta/page-posts').catch(() => []),
+  ]);
+  const ready = meta?.status === 'connected' && status?.pageId;
+  const needsReconnect = !!status?.connected && !!status?.pageId && !!status?.scopes?.length && !status.canPublish;
+
+  const banners = [];
+  if (meta?.status !== 'connected') banners.push('<div class="banner warn">Meta is not connected. <a href="#/connections">Connect Meta</a> first.</div>');
+  else if (!status?.pageId) banners.push('<div class="banner warn">No Facebook Page selected. <a href="#/connections">Connections → Meta → Select account</a>.</div>');
+  if (needsReconnect) banners.push('<div class="banner warn"><b>Posting permission missing.</b> Facebook ke saath dobara authorise karna hoga — niche wala button dabao. <button id="reconnect">Reconnect Meta</button></div>');
+  if (status?.error) banners.push(`<div class="banner err small">${esc(status.error)}</div>`);
+
+  main.innerHTML = `
+    <div class="head"><div><a href="#/dashboard" class="small" id="ppBack">← Back</a><h1>Facebook page post</h1>
+      <div class="muted">Free organic post straight to your connected Page — ye ad nahi hai, koi budget spend nahi hota.</div></div></div>
+    ${banners.join('')}
+    <form id="pp" class="card">
+      <div class="field"><label>Posting as page</label>
+        <div>${pfTag('meta')} <b>${esc(status?.pageName ?? '—')}</b></div></div>
+      <div class="field"><label>Message *</label>
+        <textarea name="message" rows="6" maxlength="5000" placeholder="Apna post yahan likho…"></textarea>
+        <div class="hint"><span id="cl">0</span>/5000 characters</div></div>
+      <div class="grid g2">
+        <div class="field"><label>Link (optional)</label><input name="link" type="url" placeholder="https://"></div>
+        <div class="field"><label>Image (optional — PNG/JPEG)</label><input type="file" name="file" accept="image/png,image/jpeg"></div>
+      </div>
+      <div class="actions">
+        <button class="primary" type="submit" ${ready && !needsReconnect ? '' : 'disabled'}>Post to page</button>
+        <span class="muted small">${ready && !needsReconnect ? 'Live Facebook par turant dikh jayega.' : 'Upar di gayi koi na koi condition poori karo.'}</span>
+      </div>
+    </form>
+    <div class="card"><h2>Recent page posts</h2>
+      ${posts.length ? posts.map((p, i) => `
+        <div style="padding:10px 0;border-bottom:1px solid var(--border)" data-post="${i}">
+          <div class="small muted">${dt(p.createdTime)}${p.permalink ? ` · <a href="${esc(p.permalink)}" target="_blank" rel="noopener">view on Facebook</a>` : ''}
+            ${ready && !needsReconnect ? ' · <a href="#" data-edit>✎ Edit</a>' : ''}</div>
+          <div data-view style="white-space:pre-wrap;margin-top:4px">${esc(p.message) || '<span class="muted">(no text)</span>'}</div>
+          <form data-editor hidden style="margin-top:6px">
+            <textarea name="message" rows="5" maxlength="5000"></textarea>
+            <div class="actions"><button class="primary" type="submit">Save</button><button type="button" data-cancel>Cancel</button>
+              <span class="muted small">Sirf text badlega. Image/link badalne ke liye naya post banana padega.</span></div>
+          </form>
+        </div>`).join('') : '<div class="empty">No posts found yet.</div>'}
+    </div>`;
+
+  $('#reconnect')?.addEventListener('click', async (e) => {
+    await busy(e.target, async () => { const { url } = await api('/connections/meta/oauth/start', { method: 'POST' }); location.href = url; }).catch(() => {});
+  });
+
+  // Go back to wherever the user came from; fall back to the dashboard on a direct visit.
+  $('#ppBack').onclick = (e) => { if (history.length > 1) { e.preventDefault(); history.back(); } };
+
+  $$('[data-post]', main).forEach((row) => {
+    const post = posts[Number(row.dataset.post)];
+    const view = $('[data-view]', row), editor = $('[data-editor]', row);
+    const open = (on) => { editor.hidden = !on; view.hidden = on; };
+    $('[data-edit]', row)?.addEventListener('click', (e) => {
+      e.preventDefault();
+      editor.message.value = post.message;
+      open(true);
+      editor.message.focus();
+    });
+    $('[data-cancel]', row).onclick = () => open(false);
+    editor.onsubmit = async (e) => {
+      e.preventDefault();
+      await busy(e.submitter, async () => {
+        await api(`/meta/page-posts/${encodeURIComponent(post.id)}`, { method: 'PUT', body: { message: editor.message.value } });
+        toast('Post updated on Facebook', 'success');
+        await pagePostView(main);
+      }, 'Saving…').catch(() => {});
+    };
+  });
+
+  const ta = $('#pp textarea[name=message]');
+  ta.oninput = () => { $('#cl').textContent = ta.value.length; };
+
+  $('#pp').onsubmit = async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    await busy(e.submitter, async () => {
+      const out = await api('/meta/page-post', { method: 'POST', form: f });
+      toast(out.permalink ? `Posted — ${out.permalink}` : 'Posted to your Facebook page', 'success', 10000);
+      await pagePostView(main);
+    }, 'Posting to Facebook…').catch(() => {});
+  };
 }
 
 // ---------- notifications / audit / settings ----------
